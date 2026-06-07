@@ -6,23 +6,24 @@ from urllib.parse import urlparse, urljoin
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi. middleware. .middleware import CORSMiddleware
-  cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 # ---------------- Settings ----------------
 ALLOWED_EXT = {".mp4", ".webm", ".mov", ".mkv"}
 MAX_CONTENT_LENGTH = 500 * 1024 * 1024  # 500MB
 TOKEN_MAX_AGE = 10 * 60                 # 10 minutes
-SECRET = os.environget("APP_SECRET", "CHANGE_ME_TO_A_RANDOM_SECRET")
+SECRET = os.environ.get("APP_SECRET", "CHANGE_ME_TO_A_RANDOM_SECRET")
 MAX_REDIRECTS = 5
 
 serializer = URLSafeTimedSerializer(SECRET, salt="dl")
 
 # ---------------- Helpers ----------------
 def host_resolves_to_private_ip(hostname: str) -> bool:
+    """SSRF protection: block private/loopback/link-local, etc."""
     try:
-        infos = socketgetaddrinfo(hostname, None)
+        infos = socket.getaddrinfo(hostname, None)
         for info in infos:
             ip = ipaddress.ip_address(info[4][0])
             if (
@@ -31,7 +32,7 @@ def host_resolves_to_private_ip(hostname: str) -> bool:
             ):
                 return True
         return False
-    except socket. gaierror:
+    except socket.gaierror:
         return True
 
 def validate_url(url: str) -> str:
@@ -60,23 +61,25 @@ def validate_url(url: str) -> str:
 def safe_filename_from_url(url: str) -> str:
     name = os.path.basename(urlparse(url).path) or "video.mp4"
     name = re.sub(r'[^A-Za-z0-9._-]+', '_', name)[:120]
-    return name or "video.mp4."
+    return name or "video.mp4"
 
 async def head_or_range_probe(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """Try HEAD, fallback to GET Range 0-0 for servers that don't support HEAD."""
     try:
-        r = await clientrequest("HEAD", url, timeout=20.0)
+        r = await client.request("HEAD", url, timeout=20.0)
         if r.status_code < 400 and ("content-type" in r.headers or "content-length" in r.headers):
             return r
     except httpx.HTTPError:
         pass
 
     try:
-        r = await clientget(url, headers={"Range": "bytes=0-0"}, timeout=20.0)
+        r = await client.get(url, headers={"Range": "bytes=0-0"}, timeout=20.0)
         return r
     except httpx.HTTPError:
         raise HTTPException(400, "Could not reach URL")
 
 async def resolve_redirects(url: str) -> str:
+    """Follow redirects safely and validate each hop (prevents redirect-to-private SSRF)."""
     url = validate_url(url)
 
     async with httpx.AsyncClient(follow_redirects=False) as client:
@@ -99,7 +102,7 @@ async def resolve_redirects(url: str) -> str:
 # ---------------- App ----------------
 app = FastAPI()
 
-origins = [o.strip() for o in os.environget("CORS_ORIGINS", "*").split(",") if o.strip()]
+origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -123,12 +126,12 @@ async def api_info(payload: dict):
     if not (ctype.startswith("video/") or "octet-stream" in ctype):
         raise HTTPException(400, f"Not a video content-type: {ctype or 'unknown'}")
 
-    length = r.headersget("content-length")
+    length = r.headers.get("content-length")
     size = int(length) if length and length.isdigit() else None
     if size and size > MAX_CONTENT_LENGTH:
         raise HTTPException(400, "File too large (max 500MB)")
 
-    token = serializerdumps({"url": final_url})
+    token = serializer.dumps({"url": final_url})
     return {
         "ok": True,
         "filename": safe_filename_from_url(final_url),
@@ -140,7 +143,7 @@ async def api_info(payload: dict):
 @app.get("/api/download")
 async def api_download(token: str, request: Request):
     try:
-        data = serializerloads(token, max_age=TOKEN_MAX_AGE)
+        data = serializer.loads(token, max_age=TOKEN_MAX_AGE)
     except SignatureExpired:
         raise HTTPException(400, "Link expired. Generate again.")
     except BadSignature:
@@ -150,7 +153,7 @@ async def api_download(token: str, request: Request):
     filename = safe_filename_from_url(final_url)
 
     headers = {}
-    if "range" in requestheaders:
+    if "range" in request.headers:
         headers["Range"] = request.headers["range"]
 
     async def stream():
